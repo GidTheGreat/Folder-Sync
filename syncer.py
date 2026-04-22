@@ -1,4 +1,4 @@
-#!/usr/bin/env  python3
+#!usr/bin/env  python3
 
 """"
 syncer - synchronize folders between environments.
@@ -8,6 +8,11 @@ Designed for workflows where code is edited in one environment
 """
 
 import os
+import logging
+import threading
+from inotify_simple import INotify,flags
+import time
+from collections import defaultdict
 import asyncio
 import sys
 import subprocess
@@ -58,88 +63,119 @@ def parse_init():
         syncer -i 10 -c ~/project /proot/project
         """
     return parser
-
 def path_util(path):
      """normalize paths so no relative path"""
      parsed_path= os.path.abspath(os.path.expanduser(path))
      return parsed_path
-
+     
 def create_source_dest():
     """load saved paths"""
     from sdst import src,dst
-    
+
     source_path= path_util(src)
     dest_path = path_util(dst)
     return source_path, dest_path
-    
-def get_mtimes(files_present,source_dir,dest_dir,
-file_mtimes,init=False,v=False):
-    """gets mtimes on each call"""
-    
-    for file in files_present:
-        file_path = os.path.join(source_dir,file)
-       
-        if init:
-            file_mtimes[file] = os.stat(file_path).st_mtime #get mtime and store it
-            if v:
-                print(f"Succesfully accessed and  stored "
-                f"initial modification time of file:'{file}'")
-        else:
-                
-                if file_mtimes[file] != os.stat(file_path).st_mtime:
-                    
-                    file_mtimes[file] = os.stat(file_path).st_mtime
-                    sync_info =  subprocess.check_output(f"rsync -av {source_dir} {dest_dir}",
-                    text=True,shell=True)
-                    if v:
-                        print("Change detected syncing")
-                        print(sync_info)
-                
-async def periodic_checker(files_present,source_dir,dest_dir,file_mtimes,
-v,interval=5):
-    
-    while True:
-          get_mtimes(files_present,source_dir,dest_dir,file_mtimes,init=False,v=v)
-          if v:
-             print("sleeping until next interval")
-          await asyncio.sleep(interval)
-    
-async def main():
-        #initial modification time
-        parser=parse_init()
-        args =parser.parse_args()
-        source_dir = None #path of where i edit files
-        dest_dir = None #path of where i run files
-        file_mtimes = {}
-        
-        if not args.source or not args.destination:
-            source_path,destination_path = create_source_dest()
-            source_dir = source_path
-            dest_dir = destination_path
 
-        else:
-            source_dir = args.source[0]
-            dest_dir = args.destination[0]
-            
-        #list of files present
-        files_present = os.listdir(source_dir)
-        if args.verbose:
-            print(f"Syncing started in mode:'{args.mode}'"
-            "watching for file "
-            f"changes in:'{source_dir}' and syncing those "
-            f"changes in:'{dest_dir}', "
-            f"sync interval is:'{args.interval}' seconds"
-            f"files to be monitored:'{files_present}'")
-        
-        
-        
-        get_mtimes(files_present,source_dir,dest_dir,
-        file_mtimes,init=True,v=args.verbose)
-        await asyncio.create_task(periodic_checker(files_present
-        ,source_dir,dest_dir,file_mtimes,args.verbose,interval=args.interval))
+class FileFlux():
+  """Track files in directory for flux"""
+  def __init__(self,source,destination,verbose=False):
+    if verbose:
+      self.level = logging.DEBUG
+    else:
+      self.level = logging.WARNING
+    logging.basicConfig(format='%(asctime)s %(message)s',level=self.level)
+    self.inotify = INotify() #init tracker object
+    self.path = source #path of dir to be trackex
+    self.dest = destination
+    self.tracked_dirs = {} # paths tracked with watch descriptor attached
+    self.running_thread = None
+    self.new_save = False
+    self.lock = threading.Lock()
+    self.event_timers = defaultdict(str)
+  
+  
+  def record_close(self):
+    with self.lock:
+      self.new_save = True
+      logging.info("closed file")
+      sync_info =  subprocess.check_output(f"rsync -av {self.path} {self.dest}",text=True,shell=True)
+      logging.debug("Change detected syncing")
+      logging.debug(sync_info)
       
-if __name__ == "__main__"  :
-      asyncio.run(main())  
+  def handle_events(self,events):
+    for event in events:
+        logging.debug(f"{event.name},{flags.from_mask(event.mask)}")
+        
+        if event.mask & flags.CLOSE_WRITE:
+          logging.info(f"Change detected")
+          #coalesce signals so we get one notification
+          with self.lock:
+            old = self.event_timers.get(event.name)
+            if old:
+              old.cancel()
+          
+          t = threading.Timer(1,self.record_close)
+          
+          self.event_timers[event.name] = t
+          t.start()
+          
+                    
+        elif event.mask & flags.CREATE and event.mask & flags.ISDIR:
+          logging.debug(f"New dir detected:{event.name}\n Adding Tracker")
+          self.add_tracker()
+    
+  def start_watcher(self):
+    """Start a thread to watch for file flux"""
+    if self.running_thread:
+      logging.debug("Running event watcher active")
+      return
+    try:
+      event_thread = threading.Thread(target=self.event_thread,daemon = True)
+      event_thread.start()
+      self.running_thread = event_thread
+      event_thread.join()
+    except Exception as e:
+      logging.error(e)
+    
+  def add_tracker(self):
+    """Add tracker and get watch descriptor for each dir and its contents"""
+    for dir, sub_dir, file in os.walk(self.path):
+      #self.path_util(dir,file)
+      if dir not in self.tracked_dirs:
+        try:
+          wd = self.inotify.add_watch(dir,flags.CREATE | flags.DELETE | flags.MODIFY | flags.CLOSE_WRITE | flags.ATTRIB | flags.MOVED_FROM | flags.MOVED_TO)
+          logging.info(f"Tracking changes in :{dir}")
+          self.tracked_dirs[dir] = wd
+        except Exception as e:
+          logging.error("Failed to add tracker  to dir:{dir}")
+  
+  def event_thread(self):
+    """Start tracking file change events"""
+    self.add_tracker()
+    while True:
+      events = self.inotify.read()
+      self.handle_events(events)
+      
+                
+if  __name__ == "__main__":
+  parser=parse_init()
+  args =parser.parse_args()
+  if not args.source or not args.destination:
+    source_path,destination_path =create_source_dest()
+    source_dir = source_path
+    dest_dir = destination_path
+
+  else:
+    source_dir = args.source[0]
+    dest_dir = args.destination[0]
+    
+  fileflux = FileFlux(source_dir,dest_dir,args.verbose)
+  fileflux.start_watcher()
+  
+
+
+      
+      
       
       
     
