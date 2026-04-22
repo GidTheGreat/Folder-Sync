@@ -23,11 +23,11 @@ Syncer is a lightweight file synchronization tool for development workflows wher
 - Python dependency:
 
  ## Installation
- ''' bash
+ ``` bash
  git clone https://github.com/your-username/syncer.git
  cd syncer
  chmod +x syncer.py
 
  ## Usage
- ''' Direct Mode
+  Direct Mode
  python syncer.py /path/to/source /path/to/destination
