@@ -6,6 +6,7 @@ syncer - synchronize folders between environments.
 Designed for workflows where code is edited in one environment
 (e.g., Android) and executed in another (e.g., proot).
 """
+__version__ = "0.1.0"
 
 import os
 import logging
