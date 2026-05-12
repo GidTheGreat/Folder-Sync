@@ -24,7 +24,7 @@ Syncer is a lightweight file synchronization tool for development workflows wher
 
  ## Installation
  ``` bash
- git clone https://github.com/your-username/syncer.git
+ git clone https://github.com/GidTheGreat/syncer.git
  cd syncer
  chmod +x syncer.py
 ```
